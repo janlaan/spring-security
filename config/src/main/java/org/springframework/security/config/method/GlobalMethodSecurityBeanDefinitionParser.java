@@ -120,6 +120,9 @@ public class GlobalMethodSecurityBeanDefinitionParser implements BeanDefinitionP
 
 	@Override
 	public BeanDefinition parse(Element element, ParserContext pc) {
+		if(true) {
+			String test_change = "test";
+		}
 		CompositeComponentDefinition compositeDef = new CompositeComponentDefinition(element.getTagName(),
 				pc.extractSource(element));
 		pc.pushContainingComponent(compositeDef);
