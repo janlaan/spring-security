@@ -274,6 +274,161 @@ public class GlobalMethodSecurityBeanDefinitionParser implements BeanDefinitionP
 		return null;
 	}
 
+	public BeanDefinition parseElement(Element element, ParserContext pc) {
+		CompositeComponentDefinition compositeDef = new CompositeComponentDefinition(element.getTagName(),
+				pc.extractSource(element));
+		pc.pushContainingComponent(compositeDef);
+		Object source = pc.extractSource(element);
+		// The list of method metadata delegates
+		ManagedList<BeanMetadataElement> delegates = new ManagedList<>();
+		boolean jsr250Enabled = "enabled".equals(element.getAttribute(ATT_USE_JSR250));
+		boolean useSecured = "enabled".equals(element.getAttribute(ATT_USE_SECURED));
+		boolean prePostAnnotationsEnabled = "enabled".equals(element.getAttribute(ATT_USE_PREPOST));
+		boolean useAspectJ = "aspectj".equals(element.getAttribute(ATT_MODE));
+		BeanDefinition preInvocationVoter = null;
+		ManagedList<BeanMetadataElement> afterInvocationProviders = new ManagedList<>();
+		// Check for an external SecurityMetadataSource, which takes priority over other
+		// sources
+		String metaDataSourceId = element.getAttribute(ATT_META_DATA_SOURCE_REF);
+		if (StringUtils.hasText(metaDataSourceId)) {
+			delegates.add(new RuntimeBeanReference(metaDataSourceId));
+		}
+		if (prePostAnnotationsEnabled) {
+			Element prePostElt = DomUtils.getChildElementByTagName(element, Elements.INVOCATION_HANDLING);
+			Element expressionHandlerElt = DomUtils.getChildElementByTagName(element, Elements.EXPRESSION_HANDLER);
+			if (prePostElt != null && expressionHandlerElt != null) {
+				pc.getReaderContext().error(Elements.INVOCATION_HANDLING + " and " + Elements.EXPRESSION_HANDLER
+						+ " cannot be used together ", source);
+			}
+			BeanDefinitionBuilder preInvocationVoterBldr = BeanDefinitionBuilder
+					.rootBeanDefinition(PreInvocationAuthorizationAdviceVoter.class);
+			// After-invocation provider to handle post-invocation filtering and
+			// authorization expression annotations.
+			BeanDefinitionBuilder afterInvocationBldr = BeanDefinitionBuilder
+					.rootBeanDefinition(PostInvocationAdviceProvider.class);
+			// The metadata source for the security interceptor
+			BeanDefinitionBuilder mds = BeanDefinitionBuilder
+					.rootBeanDefinition(PrePostAnnotationSecurityMetadataSource.class);
+			if (prePostElt != null) {
+				// Customized override of expression handling system
+				String attributeFactoryRef = DomUtils
+						.getChildElementByTagName(prePostElt, Elements.INVOCATION_ATTRIBUTE_FACTORY)
+						.getAttribute("ref");
+				String preAdviceRef = DomUtils.getChildElementByTagName(prePostElt, Elements.PRE_INVOCATION_ADVICE)
+						.getAttribute("ref");
+				String postAdviceRef = DomUtils.getChildElementByTagName(prePostElt, Elements.POST_INVOCATION_ADVICE)
+						.getAttribute("ref");
+				mds.addConstructorArgReference(attributeFactoryRef);
+				preInvocationVoterBldr.addConstructorArgReference(preAdviceRef);
+				afterInvocationBldr.addConstructorArgReference(postAdviceRef);
+			}
+			else {
+				// The default expression-based system
+				String expressionHandlerRef = (expressionHandlerElt != null) ? expressionHandlerElt.getAttribute("ref")
+						: null;
+				if (StringUtils.hasText(expressionHandlerRef)) {
+					this.logger.info(LogMessage.format("Using bean '%s' as method ExpressionHandler implementation",
+							expressionHandlerRef));
+					RootBeanDefinition lazyInitPP = new RootBeanDefinition(
+							LazyInitBeanDefinitionRegistryPostProcessor.class);
+					lazyInitPP.getConstructorArgumentValues().addGenericArgumentValue(expressionHandlerRef);
+					pc.getReaderContext().registerWithGeneratedName(lazyInitPP);
+					BeanDefinitionBuilder lazyMethodSecurityExpressionHandlerBldr = BeanDefinitionBuilder
+							.rootBeanDefinition(LazyInitTargetSource.class);
+					lazyMethodSecurityExpressionHandlerBldr.addPropertyValue("targetBeanName", expressionHandlerRef);
+					BeanDefinitionBuilder expressionHandlerProxyBldr = BeanDefinitionBuilder
+							.rootBeanDefinition(ProxyFactoryBean.class);
+					expressionHandlerProxyBldr.addPropertyValue("targetSource",
+							lazyMethodSecurityExpressionHandlerBldr.getBeanDefinition());
+					expressionHandlerProxyBldr.addPropertyValue("proxyInterfaces",
+							MethodSecurityExpressionHandler.class);
+					expressionHandlerRef = pc.getReaderContext()
+							.generateBeanName(expressionHandlerProxyBldr.getBeanDefinition());
+					pc.registerBeanComponent(new BeanComponentDefinition(expressionHandlerProxyBldr.getBeanDefinition(),
+							expressionHandlerRef));
+				}
+				else {
+					RootBeanDefinition expressionHandler = registerWithDefaultRolePrefix(pc,
+							DefaultMethodSecurityExpressionHandlerBeanFactory.class);
+					expressionHandlerRef = pc.getReaderContext().generateBeanName(expressionHandler);
+					pc.registerBeanComponent(new BeanComponentDefinition(expressionHandler, expressionHandlerRef));
+					this.logger.info("Expressions were enabled for method security but no SecurityExpressionHandler "
+							+ "was configured. All hasPermission() expressions will evaluate to false.");
+				}
+				BeanDefinitionBuilder expressionPreAdviceBldr = BeanDefinitionBuilder
+						.rootBeanDefinition(ExpressionBasedPreInvocationAdvice.class);
+				expressionPreAdviceBldr.addPropertyReference("expressionHandler", expressionHandlerRef);
+				preInvocationVoterBldr.addConstructorArgValue(expressionPreAdviceBldr.getBeanDefinition());
+				BeanDefinitionBuilder expressionPostAdviceBldr = BeanDefinitionBuilder
+						.rootBeanDefinition(ExpressionBasedPostInvocationAdvice.class);
+				expressionPostAdviceBldr.addConstructorArgReference(expressionHandlerRef);
+				afterInvocationBldr.addConstructorArgValue(expressionPostAdviceBldr.getBeanDefinition());
+				BeanDefinitionBuilder annotationInvocationFactory = BeanDefinitionBuilder
+						.rootBeanDefinition(ExpressionBasedAnnotationAttributeFactory.class);
+				annotationInvocationFactory.addConstructorArgReference(expressionHandlerRef);
+				mds.addConstructorArgValue(annotationInvocationFactory.getBeanDefinition());
+			}
+			preInvocationVoter = preInvocationVoterBldr.getBeanDefinition();
+			afterInvocationProviders.add(afterInvocationBldr.getBeanDefinition());
+			delegates.add(mds.getBeanDefinition());
+		}
+		if (useSecured) {
+			delegates.add(BeanDefinitionBuilder.rootBeanDefinition(SecuredAnnotationSecurityMetadataSource.class)
+					.getBeanDefinition());
+		}
+		if (jsr250Enabled) {
+			RootBeanDefinition jsrMetadataSource = registerWithDefaultRolePrefix(pc,
+					Jsr250MethodSecurityMetadataSourceBeanFactory.class);
+			delegates.add(jsrMetadataSource);
+		}
+		// Now create a Map<String, ConfigAttribute> for each <protect-pointcut>
+		// sub-element
+		Map<String, List<ConfigAttribute>> pointcutMap = parseProtectPointcuts(pc,
+				DomUtils.getChildElementsByTagName(element, Elements.PROTECT_POINTCUT));
+		if (pointcutMap.size() > 0) {
+			if (useAspectJ) {
+				pc.getReaderContext().error("You can't use AspectJ mode with protect-pointcut definitions", source);
+			}
+			// Only add it if there are actually any pointcuts defined.
+			BeanDefinition mapBasedMetadataSource = new RootBeanDefinition(MapBasedMethodSecurityMetadataSource.class);
+			BeanReference ref = new RuntimeBeanReference(
+					pc.getReaderContext().generateBeanName(mapBasedMetadataSource));
+			delegates.add(ref);
+			pc.registerBeanComponent(new BeanComponentDefinition(mapBasedMetadataSource, ref.getBeanName()));
+			registerProtectPointcutPostProcessor(pc, pointcutMap, ref, source);
+		}
+		BeanReference metadataSource = registerDelegatingMethodSecurityMetadataSource(pc, delegates, source);
+		// Check for additional after-invocation-providers..
+		List<Element> afterInvocationElts = DomUtils.getChildElementsByTagName(element,
+				Elements.AFTER_INVOCATION_PROVIDER);
+		for (Element elt : afterInvocationElts) {
+			afterInvocationProviders.add(new RuntimeBeanReference(elt.getAttribute(ATT_REF)));
+		}
+		String accessManagerId = element.getAttribute(ATT_ACCESS_MGR);
+		if (!StringUtils.hasText(accessManagerId)) {
+			accessManagerId = registerAccessManager(pc, jsr250Enabled, preInvocationVoter);
+		}
+		String authMgrRef = element.getAttribute(ATT_AUTHENTICATION_MANAGER_REF);
+		String runAsManagerId = element.getAttribute(ATT_RUN_AS_MGR);
+		BeanReference interceptor = registerMethodSecurityInterceptor(pc, authMgrRef, accessManagerId, runAsManagerId,
+				metadataSource, afterInvocationProviders, source, useAspectJ);
+		if (useAspectJ) {
+			BeanDefinitionBuilder aspect = BeanDefinitionBuilder.rootBeanDefinition(
+					"org.springframework.security.access.intercept.aspectj.aspect.AnnotationSecurityAspect");
+			aspect.setFactoryMethod("aspectOf");
+			aspect.setRole(BeanDefinition.ROLE_INFRASTRUCTURE);
+			aspect.addPropertyValue("securityInterceptor", interceptor);
+			String id = pc.getReaderContext().registerWithGeneratedName(aspect.getBeanDefinition());
+			pc.registerBeanComponent(new BeanComponentDefinition(aspect.getBeanDefinition(), id));
+		}
+		else {
+			registerAdvisor(pc, interceptor, metadataSource, source, element.getAttribute(ATT_ADVICE_ORDER));
+			AopNamespaceUtils.registerAutoProxyCreatorIfNecessary(pc, element);
+		}
+		pc.popAndRegisterContainingComponent();
+		return null;
+	}
+
 	/**
 	 * Register the default AccessDecisionManager. Adds the special JSR 250 voter jsr-250
 	 * is enabled and an expression voter if expression-based access control is enabled.
